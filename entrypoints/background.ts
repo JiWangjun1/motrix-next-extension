@@ -324,6 +324,9 @@ export default defineBackground(() => {
       addListener: (
         callback: (item: DeterminingFilenameItem, suggest: SuggestedFilename) => true | void,
       ) => void;
+      removeListener: (
+        callback: (item: DeterminingFilenameItem, suggest: SuggestedFilename) => true | void,
+      ) => void;
     };
   };
   type WebRequestHeader = { name?: string; value?: string };
@@ -440,13 +443,29 @@ export default defineBackground(() => {
     }
   }
 
-  function registerFilenameMetadataListeners(): void {
-    const downloads = browser.downloads as DownloadsWithDeterminingFilename;
-    downloads.onDeterminingFilename?.addListener((item, suggest) => {
-      filenameMetadata.rememberDeterminedFilename(item);
-      return filenameGate.hold(item.id, suggest);
-    });
+  // Named handler for onDeterminingFilename — saved as const so we can
+  // addListener / removeListener by reference when toggling interception.
+  const determiningFilenameHandler = (
+    item: DeterminingFilenameItem,
+    suggest: SuggestedFilename,
+  ): true | void => {
+    filenameMetadata.rememberDeterminedFilename(item);
+    return filenameGate.hold(item.id, suggest);
+  };
 
+  function registerOnDeterminingFilename(): void {
+    const downloads = browser.downloads as DownloadsWithDeterminingFilename;
+    downloads.onDeterminingFilename?.addListener(determiningFilenameHandler);
+  }
+
+  function unregisterOnDeterminingFilename(): void {
+    const downloads = browser.downloads as DownloadsWithDeterminingFilename;
+    // removeListener needs the exact same function reference passed to addListener.
+    downloads.onDeterminingFilename?.removeListener(determiningFilenameHandler);
+  }
+
+  /** Always-on listener for Content-Disposition response headers. */
+  function registerContentDispositionListener(): void {
     const browserWithWebRequest = browser as typeof browser & { webRequest?: WebRequestApi };
     try {
       browserWithWebRequest.webRequest?.onHeadersReceived?.addListener(
@@ -471,7 +490,7 @@ export default defineBackground(() => {
   }
 
   registerRequestHeaderContextListener();
-  registerFilenameMetadataListeners();
+  registerContentDispositionListener();
 
   // ─── Download interception ─────────────────────────────
   //
@@ -675,7 +694,21 @@ export default defineBackground(() => {
       });
     }
     if (changes.settings?.newValue) {
-      settings = parseDownloadSettings(changes.settings.newValue);
+      const newSettings = parseDownloadSettings(changes.settings.newValue);
+      const wasEnabled = settings.enabled;
+      settings = newSettings;
+
+      // Dynamically register/unregister onDeterminingFilename when the
+      // interception toggle changes, to avoid filename conflicts with
+      // other extensions while paused.
+      if (wasEnabled !== newSettings.enabled) {
+        if (newSettings.enabled) {
+          registerOnDeterminingFilename();
+        } else {
+          unregisterOnDeterminingFilename();
+        }
+      }
+
       void applyDownloadBarPreference().catch((e) => {
         logWarn(
           'download_bar_error',
@@ -751,6 +784,14 @@ export default defineBackground(() => {
   void ensureConfigLoaded().then(() => {
     // Register context menu after locale is loaded — fixes i18n timing
     registerContextMenus();
+
+    // Conditionally register onDeterminingFilename based on the persisted
+    // enabled state. Keeping it unregistered when disabled prevents filename
+    // conflicts with other extensions caused
+    // by Chrome's onDeterminingFilename listener registration side effects.
+    if (settings.enabled) {
+      registerOnDeterminingFilename();
+    }
 
     applyDownloadBarPreference().catch((e) => {
       logWarn(
